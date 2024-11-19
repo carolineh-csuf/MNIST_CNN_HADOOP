@@ -3,25 +3,41 @@ import time
 import torch
 import random
 import logging
+import subprocess
 import torch.nn as nn
+import seaborn as sns
 import torch.optim as optim
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import matplotlib.pyplot as plt
+from datetime import datetime
 from pyspark import SparkContext
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.multiprocessing import Manager
 from sklearn.metrics import confusion_matrix
-import seaborn as sns
+
 
 
 NUM_EPOCH = 1
-WORLD_SIZE = 1 # Number of processes (CPU cores)
+WORLD_SIZE = 4 # Number of processes (CPU cores)
 BATCH_SIZE = 64
 
 # ----------------- 1. 配置并初始化Spark -----------------
 sc = SparkContext("local", "MNIST_CNN_DDP")
+
+# 设置日志级别为 ERROR
+#sc.setLogLevel("OFF")
+sc.setLogLevel("OFF")
+
+# 本地文件路径和 HDFS 路径
+local_checkpoint_path = "model_checkpoint.pth"
+hdfs_checkpoint_folder = "/user/MNIST_Checkpoint"
+
+# 为文件添加时间戳
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+file_name_with_timestamp = f"model_checkpoint_{timestamp}.pth"
+
 
 # ----------------- 2. 定义数据预处理函数 -----------------
 def preprocess_data(record):
@@ -130,11 +146,12 @@ def load_checkpoint(model, optimizer, filename="model_checkpoint.pth"):
     if torch.distributed.get_rank() == 0 and os.path.exists(filename) :
         checkpoint = torch.load(filename)
         print(f"Loaded checkpoint from {filename}")
-        epoch = checkpoint['epoch']
+        #epoch = checkpoint['epoch']
+        epoch = checkpoint['epoch'] + 1  # 从保存的 epoch 后一个 epoch 开始训练
         loss = checkpoint.get('loss', 0.0)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print(f"Checkpoint loaded from epoch {epoch}, loss {loss}")
+        print(f"Checkpoint loaded from epoch {epoch - 1}, loss {loss}")
 
         epoch_tensor = torch.tensor(epoch).to(torch.device("cpu"))
         loss_tensor = torch.tensor(loss).to(torch.device("cpu"))
@@ -180,6 +197,32 @@ def save_checkpoint(model, optimizer, epoch, loss, filename="model_checkpoint.pt
         torch.save(checkpoint, filename)
         print(f"Checkpoint saved to {filename} at epoch {epoch}")
 
+def save_checkpoint_to_hdfs_via_subprocess(local_path, hdfs_folder):
+    if not os.path.exists(local_path):
+        print(f"本地文件 {local_path} 不存在，无法上传。")
+        return
+
+
+    try:
+        # 确保 HDFS 目录存在
+        subprocess.run(["hdfs", "dfs", "-mkdir", "-p", hdfs_folder], check=True)
+
+        # 上传文件到 HDFS 并使用时间戳命名
+        hdfs_full_path = os.path.join(hdfs_folder, file_name_with_timestamp)
+
+        # 上传文件
+        #subprocess.run(["hdfs", "dfs", "-put", "-f", local_path, hdfs_folder], check=True)
+        subprocess.run(["hdfs", "dfs", "-put", "-f", local_path, hdfs_full_path], check=True)
+        #print(f"文件已成功上传到 HDFS：{hdfs_folder}/{os.path.basename(local_path)}")
+        print(f"文件已成功上传到 HDFS：{hdfs_full_path}")
+        # 删除本地文件
+        os.remove(local_path)
+        print(f"本地文件 {local_path} 已删除。")
+    except subprocess.CalledProcessError as e:
+        print(f"HDFS 操作失败：{e}")
+    except Exception as e:
+        print(f"发生错误：{e}")
+
 # ----------------- 5. DDP初始化 -----------------
 def init_process(rank, model, optimizer, train_dataset, world_size, loss_dict, accuracy_dict):
     # 设置线程数
@@ -197,7 +240,8 @@ def init_process(rank, model, optimizer, train_dataset, world_size, loss_dict, a
 
     # 只有 rank 0 加载 checkpoint
     # To avoid multi process simulation deadlock. Here is only allow 1 worker to use checkpoint function.
-    if rank == 0 and WORLD_SIZE == 1 :
+    if rank == 0 :
+    #if rank == 0 and WORLD_SIZE == 1 :
         start_epoch, loss = load_checkpoint(model, optimizer, filename="model_checkpoint.pth")
     else:
         start_epoch, loss = 0, 0.0  # 其他 rank 从头开始
@@ -205,6 +249,8 @@ def init_process(rank, model, optimizer, train_dataset, world_size, loss_dict, a
     # Using DistributedSampler for data parallelism
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler,num_workers=1)
+
+    dist.barrier()
 
     # 设置 epoch，确保数据加载器按正确顺序读取数据
     train_sampler.set_epoch(start_epoch)  # 设置正确的 epoch
@@ -323,6 +369,9 @@ def init_process(rank, model, optimizer, train_dataset, world_size, loss_dict, a
         logging.info(f"Final Training Accuracy:   {total_accuracy.item() / world_size:.2f}%")
         logging.info(f"Total Training Time:       {training_time:.2f} seconds")
         logging.info(f"{'='*53}")
+
+    if rank == 0:
+        save_checkpoint_to_hdfs_via_subprocess(local_checkpoint_path, hdfs_checkpoint_folder)
 
     dist.barrier()
 
@@ -485,6 +534,9 @@ def main():
         print(f"Final Test Accuracy: {final_accuracy:.2f}%")
         # Plot confusion matrix after final accuracy
         plot_confusion_matrix(model, test_loader)
+
+    # 在主函数最后停止 SparkContext
+    sc.stop()
 
 if __name__ == "__main__":
     main()
