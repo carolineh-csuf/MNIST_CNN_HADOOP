@@ -12,18 +12,19 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
-#import torchvision.transforms.functional as TF
-from datetime import datetime
-from pyspark import SparkConf, SparkContext
-#from pyspark.sql import SparkSession
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.multiprocessing import Manager
 from torchsummary import summary
+from datetime import datetime
+from pyspark import SparkContext
 from sklearn.metrics import confusion_matrix
+#from pyspark import SparkConf, SparkContext
+#from pyspark.sql import SparkSession
+#import torchvision.transforms.functional as TF
 
 NUM_EPOCH = 5
-WORLD_SIZE = 7 # Number of processes (CPU cores)
+WORLD_SIZE = 1 # Number of processes (CPU cores)
 BATCH_SIZE = 64
 
 # 本地文件路径和 HDFS 路径
@@ -599,91 +600,177 @@ def plot_confusion_matrix(model, data_loader, num_classes=10):
     plt.title('Confusion Matrix')
     plt.show()
 
+
+def prepare_data(train_images_path, train_labels_path, t10k_images_path, t10k_labels_path):
+    """
+    Prepare the training and testing datasets from binary files.
+    """
+    train_images = sc.binaryFiles(train_images_path)
+    train_labels = sc.binaryFiles(train_labels_path)
+    test_images = sc.binaryFiles(t10k_images_path)
+    test_labels = sc.binaryFiles(t10k_labels_path)
+
+    train_data_rdd = get_mnist_data(train_images, train_labels)
+    test_data_rdd = get_mnist_data(test_images, test_labels)
+
+    train_data = train_data_rdd.collect()
+    test_data = test_data_rdd.collect()
+
+    return train_data, test_data
+
+
+def build_datasets(train_data, test_data):
+    """
+    Build PyTorch datasets from the processed MNIST data.
+    """
+    train_images, train_labels = zip(*train_data)
+    test_images, test_labels = zip(*test_data)
+
+    train_dataset = MNISTDataset(train_images, train_labels)
+    test_dataset = MNISTDataset(test_images, test_labels)
+
+    return train_dataset, test_dataset
+
+def initialize_model(device):
+    """
+    Initialize the model and optimizer.
+    """
+    model = ImprovedCNN2().to(device)
+    summary(model, input_size=(1, 28, 28))
+    optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    return model, optimizer
+
+
+def train_model(train_dataset, model, optimizer, world_size):
+    """
+    Train the model using distributed data parallel (DDP) with multiprocessing.
+    """
+    manager = Manager()
+    batch_loss_dict = manager.dict()
+    loss_dict = manager.dict()
+    accuracy_dict = manager.dict()
+
+    mp.spawn(
+        init_process,
+        args=(model, optimizer, train_dataset, world_size, loss_dict, accuracy_dict, batch_loss_dict),
+        nprocs=world_size,
+        join=True
+    )
+
+    return batch_loss_dict, loss_dict, accuracy_dict
+
+def evaluate_model(model, test_dataset):
+    """
+    Evaluate the model and display the results.
+    """
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    final_accuracy = calculate_accuracy(model, test_loader)
+    print(f"Final Test Accuracy: {final_accuracy:.2f}%")
+    plot_confusion_matrix(model, test_loader)
 # ----------------- 6. 设置模型和优化器 -----------------
 def main():
     device = torch.device("cpu")
-    # 读取原始数据
-    train_images = sc.binaryFiles(train_images_path)
-    train_labels = sc.binaryFiles(train_labels_path)
-    test_images = sc.binaryFiles(t10k_images_path)  # 读取测试集图像
-    test_labels = sc.binaryFiles(t10k_labels_path)  # 读取测试集标签
 
-
-    # # 获取训练数据
-    # train_images, train_labels = get_mnist_data(train_images, train_labels)
-    #
-    # # 获取测试数据
-    # test_images, test_labels = get_mnist_data(test_images, test_labels)
-    #
-    #
-    #
-    # # 创建 PyTorch 数据集
-    # train_dataset = MNISTDataset(train_images, train_labels)
-    #
-    # test_dataset = MNISTDataset(test_images, test_labels)
-
-    # 将数据收集到本地
-    train_mnist_data_rdd = get_mnist_data(train_images, train_labels)
-    test_mnist_data_rdd = get_mnist_data(test_images, test_labels)
-    train_data = train_mnist_data_rdd.collect()  # 触发计算并收集结果到本地
-    # Check the length of train_data
-    #print(f"Length of train_data: {len(train_data)}")  # Should be 60,000 (one tuple for each image)
-
-    test_data = test_mnist_data_rdd.collect()  # 触发计算并收集结果到本地
-
-    # Unzip the train data into individual images and labels
-    train_images, train_labels = zip(*train_data)
-
-    # Check the lengths of train_images and train_labels
-    #print(f"Number of train images: {len(train_images)}")  # Should be 60,000
-    #print(f"Number of train labels: {len(train_labels)}")  # Should be 60,000
-
-    # Check the shape of the first image and the first label
-    print(f"First image shape: {train_images[0].shape}")  # Should be (28, 28)
-    print(f"First label: {train_labels[0]}")  # The first label (e.g., 5)
-
-    # Create the MNISTDataset
-    train_dataset = MNISTDataset(train_images, train_labels)
-
-    # Verify the dataset length
-    #print(f"Number of training MNISTDataset: {len(train_dataset)}")  # Should be 60,000
-
-
-# 将结果转换为 PyTorch Dataset
-    test_images, test_labels = zip(*test_data)  # 将解析出的图像和标签分开
-    test_dataset = MNISTDataset(test_images, test_labels)
+    # Data preparation
+    train_data, test_data = prepare_data(train_images_path, train_labels_path, t10k_images_path, t10k_labels_path)
+    train_dataset, test_dataset = build_datasets(train_data, test_data)
 
     # 打印训练数据集的长度
     print(f"Number of training MNISTDataset: {len(train_dataset)}")
-
     # 打印测试数据集的长度
     print(f"Number of test MNISTDataset: {len(test_dataset)}")
 
     # Display some sample images from the training dataset
     show_sample_images(train_dataset, num_images=10)
 
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    # Model initialization
+    model, optimizer = initialize_model(device)
 
-    #model = SimpleCNN().to(device)
-    #model = OptimizedCNN().to(device)
-    #model = ImprovedCNN().to(device)
-    model = ImprovedCNN2().to(device)
+    # Distributed training
+    batch_loss_dict, loss_dict, accuracy_dict = train_model(train_dataset, model, optimizer, WORLD_SIZE)
 
-    # 打印模型摘要，输入尺寸为 (1, 28, 28)，因为 MNIST 图像是 28x28 的单通道图像
-    summary(model, input_size=(1, 28, 28))
-
-    optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-
-    world_size = WORLD_SIZE  # Number of processes (CPU cores)
-
-    # Using Manager to create a shared list for loss and accuracy
-    manager = Manager()
-    batch_loss_dict = manager.dict()
-    loss_dict = manager.dict()
-    accuracy_dict = manager.dict()
-
-    # Run DDP training using multiprocessing
-    mp.spawn(init_process, args=(model, optimizer, train_dataset, world_size, loss_dict, accuracy_dict,batch_loss_dict), nprocs=world_size, join=True)
+    #     # 读取原始数据
+#     train_images = sc.binaryFiles(train_images_path)
+#     train_labels = sc.binaryFiles(train_labels_path)
+#     test_images = sc.binaryFiles(t10k_images_path)  # 读取测试集图像
+#     test_labels = sc.binaryFiles(t10k_labels_path)  # 读取测试集标签
+#
+#
+#     # # 获取训练数据
+#     # train_images, train_labels = get_mnist_data(train_images, train_labels)
+#     #
+#     # # 获取测试数据
+#     # test_images, test_labels = get_mnist_data(test_images, test_labels)
+#     #
+#     #
+#     #
+#     # # 创建 PyTorch 数据集
+#     # train_dataset = MNISTDataset(train_images, train_labels)
+#     #
+#     # test_dataset = MNISTDataset(test_images, test_labels)
+#
+#     # 将数据收集到本地
+#     train_mnist_data_rdd = get_mnist_data(train_images, train_labels)
+#     test_mnist_data_rdd = get_mnist_data(test_images, test_labels)
+#     train_data = train_mnist_data_rdd.collect()  # 触发计算并收集结果到本地
+#     # Check the length of train_data
+#     #print(f"Length of train_data: {len(train_data)}")  # Should be 60,000 (one tuple for each image)
+#
+#     test_data = test_mnist_data_rdd.collect()  # 触发计算并收集结果到本地
+#
+#     # Unzip the train data into individual images and labels
+#     train_images, train_labels = zip(*train_data)
+#
+#     # Check the lengths of train_images and train_labels
+#     #print(f"Number of train images: {len(train_images)}")  # Should be 60,000
+#     #print(f"Number of train labels: {len(train_labels)}")  # Should be 60,000
+#
+#     # Check the shape of the first image and the first label
+#     print(f"First image shape: {train_images[0].shape}")  # Should be (28, 28)
+#     print(f"First label: {train_labels[0]}")  # The first label (e.g., 5)
+#
+#     # Create the MNISTDataset
+#     train_dataset = MNISTDataset(train_images, train_labels)
+#
+#     # Verify the dataset length
+#     #print(f"Number of training MNISTDataset: {len(train_dataset)}")  # Should be 60,000
+#
+#
+# # 将结果转换为 PyTorch Dataset
+#     test_images, test_labels = zip(*test_data)  # 将解析出的图像和标签分开
+#     test_dataset = MNISTDataset(test_images, test_labels)
+#
+#     # 打印训练数据集的长度
+#     print(f"Number of training MNISTDataset: {len(train_dataset)}")
+#
+#     # 打印测试数据集的长度
+#     print(f"Number of test MNISTDataset: {len(test_dataset)}")
+#
+#     # Display some sample images from the training dataset
+#     show_sample_images(train_dataset, num_images=10)
+#
+#     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+#
+#     #model = SimpleCNN().to(device)
+#     #model = OptimizedCNN().to(device)
+#     #model = ImprovedCNN().to(device)
+#     model = ImprovedCNN2().to(device)
+#
+#     # 打印模型摘要，输入尺寸为 (1, 28, 28)，因为 MNIST 图像是 28x28 的单通道图像
+#     summary(model, input_size=(1, 28, 28))
+#
+#     optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+#
+#     world_size = WORLD_SIZE  # Number of processes (CPU cores)
+#
+#     # Using Manager to create a shared list for loss and accuracy
+#     manager = Manager()
+#     batch_loss_dict = manager.dict()
+#     loss_dict = manager.dict()
+#     accuracy_dict = manager.dict()
+#
+#     # Run DDP training using multiprocessing
+#     mp.spawn(init_process, args=(model, optimizer, train_dataset, world_size, loss_dict, accuracy_dict,batch_loss_dict), nprocs=world_size, join=True)
 
     # Plot loss curve for each rank (only rank 0 should plot)
     if 0 == 0:
@@ -693,12 +780,10 @@ def main():
     if 0 == 0:
         plot_accuracy_curve(accuracy_dict)
 
-    # Final accuracy calculation (rank 0 will handle it)
+
+    # Model evaluation
     if 0 == 0:
-        final_accuracy = calculate_accuracy(model, test_loader)
-        print(f"Final Test Accuracy: {final_accuracy:.2f}%")
-        # Plot confusion matrix after final accuracy
-        plot_confusion_matrix(model, test_loader)
+        evaluate_model(model, test_dataset)
 
     # 在主函数最后停止 SparkContext
     sc.stop()
